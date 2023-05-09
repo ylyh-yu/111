@@ -1,0 +1,164 @@
+import os
+import sys
+import optparse
+import random
+import numpy as np
+from collections import deque
+from keras.models import Sequential
+from keras.layers import Dense
+from keras.optimizers import Adam
+import traci
+
+os.environ["SUMO_HOME"] = "/usr/share/sumo"
+
+
+class DQNAgent:
+    def __init__(self, state_size, action_size):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.memory = deque(maxlen=2000)
+        self.gamma = 0.95
+        self.epsilon = 1.0
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.995
+        self.learning_rate = 0.001
+        self.model = self._build_model()
+
+
+    def _build_model(self):
+        model = Sequential()
+        model.add(Dense(24, input_dim=self.state_size, activation='relu'))
+        model.add(Dense(24, activation='relu'))
+        model.add(Dense(self.action_size, activation='linear'))
+        model.compile(loss='mse',
+                      optimizer=Adam(lr=self.learning_rate))
+        return model
+
+
+    def remember(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
+
+
+    def act(self, state):
+        if np.random.rand() <= self.epsilon:
+            return random.randrange(self.action_size)
+        act_values = self.model.predict(state)
+        return np.argmax(act_values[0])
+
+
+
+    def train(self, batch_size):
+        minibatch = random.sample(self.memory, batch_size)
+        for state, action, reward, next_state, done in minibatch:
+            target = reward
+            if not done:
+                target = (reward + self.gamma *
+                          np.amax(self.model.predict(next_state)[0]))
+            target_f = self.model.predict(state)
+            target_f[0][action] = target
+            self.model.fit(state, target_f, epochs=1, verbose=0)
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+
+
+
+def run():
+    env = IntersectionEnv()
+    agent = DQNAgent(env.state_size, env.action_size)
+    batch_size = 32
+
+    for e in range(200):
+        state = env.reset()
+        state = np.reshape(state, [1, env.state_size])
+        for time in range(500):
+            action = agent.act(state)
+            next_state, reward, done = env.step(action)
+            next_state = np.reshape(next_state, [1, env.state_size])
+            agent.remember(state, action, reward, next_state, done)
+            state = next_state
+            if done:
+                print("episode: {}/{}, score: {}, e: {:.2}"
+                      .format(e, 200, time, agent.epsilon))
+                break
+        if len(agent.memory) > batch_size:
+            agent.train(batch_size)
+
+
+
+class IntersectionEnv:
+    def __init__(self):
+        self.state_size = 16
+        self.action_size = 9
+        traci.start(['sumo-gui', "-c", "sim.sumocfg",
+                     "--start", "-Q", "--no-step-log"])
+
+
+    def reset(self):
+
+        traci.trafficlight.setPhase("J1", 0)
+        while traci.simulation.getMinExpectedNumber() > 0:
+            traci.simulationStep()
+        state = self._get_state()
+        return state
+
+
+    def step(self, action):
+        yellow_duration = 3
+        if action == 0:
+            phase_duration = [yellow_duration, 34, yellow_duration, 34]  # W-E
+        elif action == 1:
+            phase_duration = [yellow_duration, 17, yellow_duration, 17]  # W-E
+        elif action == 2:
+            phase_duration = [yellow_duration, 0, yellow_duration, 0]  # W-E
+        elif action == 3:
+            phase_duration = [yellow_duration, 0, yellow_duration, 17]  # S-N
+        elif action == 4:
+            phase_duration = [yellow_duration, 0, yellow_duration, 34]  # S-N
+        elif action == 5:
+            phase_duration = [yellow_duration, 17, yellow_duration, 34]  # S-N
+        elif action == 6:
+            phase_duration = [yellow_duration, 17, yellow_duration, 0]  # E-W
+        elif action == 7:
+            phase_duration = [yellow_duration, 34, yellow_duration, 0]  # E-W
+        else:
+            phase_duration = [yellow_duration, 34, yellow_duration, 17]  # E-W
+        for i in range(sum(phase_duration)):
+            traci.trafficlight.setPhaseDuration("J1", phase_duration[i % 4])
+            traci.simulationStep()
+        state = self._get_state()
+        reward = self._reward(state)
+        done = False
+        return state, reward, done
+
+
+    def _reward(self, state):
+        return np.sum(state) / 200.0
+
+
+    def _get_state(self):
+        state = []
+        for i in range(4):
+            for j in range(4):
+                lane_id = "t{}_{}_{}to{}_0".format(i, j, (j + 1) % 4, i)
+                lane = traci.lane.getSubscriptionResults(lane_id)
+                speed = lane[traci.constants.LAST_STEP_MEAN_SPEED]
+                angle = lane[traci.constants.LAST_STEP_ORIENTATION]
+                state.append(speed)
+                state.append(angle)
+        tls = traci.trafficlight.getSubscriptionResults("TL")
+        state.append(tls[traci.constants.TL_RED_YELLOW_GREEN_STATE][0] == "r")
+        state.append(tls[traci.constants.TL_RED_YELLOW_GREEN_STATE][0] == "y")
+        state.append(tls[traci.constants.TL_RED_YELLOW_GREEN_STATE][0] == "g")
+        state = np.array(state)
+        return state
+
+
+
+if __name__ == "__main__":
+    run()
+    traci.close()
+    sys.stdout.flush()
+#
+# 在SUMO交通仿真平台上使用DQN实现交叉口信号控制。代码将交叉口环境建模为一个类，并为其定义了许多方法（例如reset()、step()、reward()
+# 等）。它还实现了一个DQNAgent类，并使用Keras构建了一个多层感知机模型来实现Q函数的逼近。在主函数中，每个episode中的动作都是根据DQNAgent在当前状态下所推荐的动作进行选择的。通过train()
+# 方法来更新模型。在训练过程中，DQNAgent根据当前状态选择探索（随机动作）或利用（最优动作），随着训练的不断进行，探索率下降，最终收敛于最优策略。
